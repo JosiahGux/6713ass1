@@ -155,10 +155,12 @@ _level_vocab = None
 _level_counts = None
 _nlp = None
 _lm = None
-_data_path = "data.csv"
+_data_path = "../data.csv"
 
-# Replacement quality: min similarity to accept (avoid bad substitutions)
-_MIN_SIMILARITY = 0.28
+# Replacement quality: min semantic similarity to even consider a candidate
+_MIN_SIMILARITY = 0.45
+# If the best candidate overall score is below this, we skip replacement
+_MIN_OVERALL_SCORE = 0.40
 # Weight: similarity vs LM vs frequency
 _W_SIM, _W_LM, _W_FREQ = 0.55, 0.30, 0.15
 
@@ -241,10 +243,11 @@ def _best_replacement_wordnet(original_word, target_vocab):
 
 def _inflect_to_match(replacement_word, orig_tok):
     """
-    If original token is a verb, inflect replacement to same form (e.g. past -> bought).
+    Try to inflect replacement_word so that its morphological form
+    (tense/number, etc.) matches orig_tok as much as possible.
     Uses pyinflect when available.
     """
-    if not replacement_word or not orig_tok or orig_tok.pos_ != "VERB":
+    if not replacement_word or not orig_tok:
         return replacement_word
     try:
         from pyinflect import getInflection
@@ -334,13 +337,14 @@ def _best_replacement(
             fsc = freq_score(w)
             score = (
                 _W_SIM * sim
-                + _W_LM * max(0, (lm_score / 10.0 + 0.5))
+                + _W_LM * max(0.0, (lm_score / 10.0 + 0.5))
                 + _W_FREQ * fsc
             )
             if score > best_score:
                 best_score = score
                 best_word = w
-        if best_word is not None:
+        # 加一层整体分数阈值：分数太低宁可不换
+        if best_word is not None and best_score >= _MIN_OVERALL_SCORE:
             if orig_tok is not None:
                 best_word = _inflect_to_match(best_word, orig_tok) or best_word
             return best_word
@@ -419,7 +423,13 @@ def transform_sentence(sentence, source_level, target_level):
     rebuilt = []
     last_word = None
     for tok in doc:
-        if tok.is_alpha and tok.lower_ not in target_vocab:
+        # Only consider replacing content words, and avoid named entities.
+        if (
+            tok.is_alpha
+            and tok.lower_ not in target_vocab
+            and tok.pos_ in {"NOUN", "VERB", "ADJ", "ADV"}
+            and not tok.ent_type_
+        ):
             rep = _best_replacement(
                 tok.text,
                 target_vocab,
