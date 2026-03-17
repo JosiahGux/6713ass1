@@ -20,13 +20,13 @@ MAX_REPLACEMENTS = 2
 
 DIFF_THRESHOLD = 1.00
 TARGET_BAND = 0.90
-MIN_REPLACE_MARGIN = 0.78 #1.00
+MIN_REPLACE_MARGIN = 1.00 #fallback only #0.78 #1.00
 
 W_TARGET = 1.90
 W_SEMANTIC = 2.20
 W_CONTEXT = 1.20
 W_LM = 0.55
-W_FREQ = 0.30
+W_FREQ = 0.45 #0.30
 W_LENGTH = 0.15
 
 CONTEXT_WINDOW = 2
@@ -34,9 +34,34 @@ MAX_DIST_CANDIDATES = 15
 MAX_WN_CANDIDATES = 15
 TOP_POSITIONS = 4
 
-DIST_CTX_THRESHOLD = 0.18 #0.22
-FINAL_SEM_THRESHOLD = 0.28 #0.35
+#Threshold
+DIST_CTX_THRESHOLD = 0.22#0.18 #0.22
+FINAL_SEM_THRESHOLD = 0.35#0.28 #0.35
+POS_DIST_CTX_THRESHOLD = {
+    "VERB": 0.14,
+    "ADJ": 0.14,
+    "ADV": 0.32,
+    "NOUN": 0.30,
+}
 
+POS_SEM_THRESHOLD = {
+    "VERB": 0.24,
+    "ADJ": 0.24,
+    "ADV": 0.40,
+    "NOUN": 0.42,
+}
+
+POS_MIN_MARGIN = {
+    "VERB": 0.60,
+    "ADJ": 0.58,
+    "ADV": 0.95,
+    "NOUN": 1.15,
+}
+
+FORCE_ONE_REPLACEMENT = True
+FALLBACK_SENTENCE_GAP = 1.20
+FALLBACK_MIN_SCORE = 0.20
+FALLBACK_MIN_SEM = 0.22
 # -------------------------------------------------
 # Optional external NLP resources with safe fallback
 # -------------------------------------------------
@@ -627,8 +652,13 @@ class LexicalModel:
             if not is_clean_candidate(cand):
                 continue
 
+            #ctx = self.context_cosine(lemma, cand)
+            #if ctx < DIST_CTX_THRESHOLD:
+                #continue
+
             ctx = self.context_cosine(lemma, cand)
-            if ctx < DIST_CTX_THRESHOLD:
+            ctx_threshold = POS_DIST_CTX_THRESHOLD.get(pos, DIST_CTX_THRESHOLD)
+            if ctx < ctx_threshold:
                 continue
 
             tgt_gain = abs(src_diff - target_idx) - abs(self.difficulty(cand) - target_idx)
@@ -741,7 +771,8 @@ def token_is_replaceable(tok, pos, idx, tokens):
 
     return True
 """
-#优先改adj adv verb
+# Prioritize adj adv verb
+"""
 def token_is_replaceable(tok, pos, idx, tokens):
     if not is_word(tok):
         return False
@@ -761,6 +792,19 @@ def token_is_replaceable(tok, pos, idx, tokens):
         if idx > 0 and tokens[idx - 1].lower() in {"the", "a", "an"}:
             return False
 
+    return True
+"""
+def token_is_replaceable(tok, pos, idx, tokens):
+    if not is_word(tok):
+        return False
+    if pos not in {"VERB", "ADJ"}:
+        return False
+    if is_stopword(tok):
+        return False
+    if len(tok) <= 2:
+        return False
+    if tok[0].isupper() and idx != 0:
+        return False
     return True
 
 def score_candidate(
@@ -804,7 +848,7 @@ def score_candidate(
         + W_LENGTH * length_bonus
     )
     """
-    noun_penalty = -0.45 if source_pos == "NOUN" else 0.0
+    #noun_penalty = -0.45 if source_pos == "NOUN" else 0.0
 
     total = (
             W_TARGET * target_gain
@@ -813,7 +857,7 @@ def score_candidate(
             + W_LM * lm_gain
             + W_FREQ * freq_bonus
             + W_LENGTH * length_bonus
-            + noun_penalty
+            #+ noun_penalty
     )
 
     return {
@@ -853,6 +897,7 @@ def transform_sentence(sentence, source_level, target_level):
     pos_tags, raw_tags = pos_tag_tokens(tokens)
     lemmas = [lemmatize(tok, pos_tags[i]) if is_word(tok) else None for i, tok in enumerate(tokens)]
 
+    sentence_max_gap = 0.0
     position_scores = []
     for i, tok in enumerate(tokens):
         pos = pos_tags[i]
@@ -866,6 +911,8 @@ def transform_sentence(sentence, source_level, target_level):
         diff = model.difficulty(lemma)
         gap = abs(diff - target_idx)
         conf = model.confidence(lemma)
+
+        sentence_max_gap = max(sentence_max_gap, gap)
 
         if gap < DIFF_THRESHOLD:
             continue
@@ -890,6 +937,12 @@ def transform_sentence(sentence, source_level, target_level):
     new_tokens = list(tokens)
     replacements_done = 0
 
+    fallback_best = None
+    fallback_best_feats = None
+    fallback_best_pos = None
+    fallback_best_tok = None
+    fallback_best_pos_tag = None
+
     for i in chosen_positions:
         if replacements_done >= MAX_REPLACEMENTS:
             break
@@ -903,15 +956,15 @@ def transform_sentence(sentence, source_level, target_level):
 
         #for cand in model.wordnet_candidates(lemma, pos):
             #candidates.add(cand)
-
        #for cand in model.distributional_candidates(lemma, pos, target_idx):
             #candidates.add(cand)
-        if pos in {"VERB", "ADJ", "ADV"}:
+        #if pos in {"VERB", "ADJ", "ADV"}:
+        if pos in {"VERB", "ADJ"}:
             for cand in model.wordnet_candidates(lemma, pos):
                 candidates.add(cand)
 
-        for cand in model.distributional_candidates(lemma, pos, target_idx):
-            candidates.add(cand)
+            for cand in model.distributional_candidates(lemma, pos, target_idx):
+                candidates.add(cand)
 
         filtered = []
         src_diff = model.difficulty(lemma)
@@ -932,10 +985,13 @@ def transform_sentence(sentence, source_level, target_level):
             if abs(cand_diff - target_idx) >= abs(src_diff - target_idx) - 0.01:
                 continue
 
+            #sem = semantic_similarity(lemma, cand, pos, model)
+            #if sem < FINAL_SEM_THRESHOLD:
+                #continue
             sem = semantic_similarity(lemma, cand, pos, model)
-            if sem < FINAL_SEM_THRESHOLD:
+            sem_threshold = POS_SEM_THRESHOLD.get(pos, FINAL_SEM_THRESHOLD)
+            if sem < sem_threshold:
                 continue
-
             filtered.append(cand)
 
         if DEBUG_TRACE:
@@ -974,7 +1030,18 @@ def transform_sentence(sentence, source_level, target_level):
         if best is None:
             continue
 
-        if best_feats["final_total"] < MIN_REPLACE_MARGIN:
+        if best is not None and best_feats is not None:
+            if fallback_best_feats is None or best_feats["final_total"] > fallback_best_feats["final_total"]:
+                fallback_best = best
+                fallback_best_feats = best_feats
+                fallback_best_pos = i
+                fallback_best_tok = tok
+                fallback_best_pos_tag = pos
+
+        # if best_feats["final_total"] < MIN_REPLACE_MARGIN:
+        # continue
+        min_margin = POS_MIN_MARGIN.get(pos, MIN_REPLACE_MARGIN)
+        if best_feats["final_total"] < min_margin:
             continue
 
         replacement = inflect_like(
@@ -996,5 +1063,25 @@ def transform_sentence(sentence, source_level, target_level):
         new_tokens[i] = replacement
         lemmas[i] = lemmatize(replacement, pos)
         replacements_done += 1
+
+    if (
+            replacements_done == 0
+            and FORCE_ONE_REPLACEMENT
+            and fallback_best is not None
+            and fallback_best_feats is not None
+            and sentence_max_gap >= FALLBACK_SENTENCE_GAP
+            and fallback_best_feats["final_total"] >= FALLBACK_MIN_SCORE
+            and fallback_best_feats["semantic"] >= FALLBACK_MIN_SEM
+    ):
+        replacement = inflect_like(
+            fallback_best,
+            fallback_best_tok,
+            fallback_best_pos_tag,
+            prev_tok=new_tokens[fallback_best_pos - 1] if fallback_best_pos > 0 else "",
+            next_tok=new_tokens[fallback_best_pos + 1] if fallback_best_pos + 1 < len(new_tokens) else "",
+        )
+
+        if replacement.lower() != fallback_best_tok.lower() and re.fullmatch(r"[A-Za-z]+(?:'[A-Za-z]+)?", replacement):
+            new_tokens[fallback_best_pos] = replacement
 
     return detokenize(new_tokens)
