@@ -1,5 +1,6 @@
 from pathlib import Path
 from collections import Counter, defaultdict
+from typing import Dict, List, Optional
 import math
 import re
 
@@ -7,74 +8,44 @@ import pandas as pd
 
 
 CEFR_LEVELS = ["A1", "A2", "B1", "B2", "C1", "C2"]
-LEVEL_TO_IDX = {lvl: i for i, lvl in enumerate(CEFR_LEVELS)}
+LEVEL_TO_NUM = {lvl: i + 1 for i, lvl in enumerate(CEFR_LEVELS)}
 
 # -------------------------------------------------
 # Tunable parameters
 # -------------------------------------------------
 
-DEBUG_TRACE = False
+MAX_REPLACEMENTS = 1
+MAX_POSITIONS_TO_CHECK = 4
+MAX_WORDNET_CANDIDATES = 12
 
-MIN_WORD_FREQ = 8
-MAX_REPLACEMENTS = 2
+MIN_DOC_FREQ = 2
+MIN_GLOBAL_CAND_FREQ = 5
+MIN_SEMANTIC_SIM = 0.24
+MIN_TARGET_GAIN = 0.10
+MIN_FINAL_SCORE = 0.28
 
-DIFF_THRESHOLD = 1.00
-TARGET_BAND = 0.90
-MIN_REPLACE_MARGIN = 1.00 #fallback only #0.78 #1.00
+ALPHA_TARGET = 0.42
+ALPHA_SEM = 0.36
+ALPHA_CONTEXT = 0.16
+ALPHA_FREQ = 0.06
 
-W_TARGET = 1.90
-W_SEMANTIC = 2.20
-W_CONTEXT = 1.20
-W_LM = 0.55
-W_FREQ = 0.45 #0.30
-W_LENGTH = 0.15
-
-CONTEXT_WINDOW = 2
-MAX_DIST_CANDIDATES = 15
-MAX_WN_CANDIDATES = 15
-TOP_POSITIONS = 4
-
-#Threshold
-DIST_CTX_THRESHOLD = 0.22#0.18 #0.22
-FINAL_SEM_THRESHOLD = 0.35#0.28 #0.35
-POS_DIST_CTX_THRESHOLD = {
-    "VERB": 0.14,
-    "ADJ": 0.14,
-    "ADV": 0.32,
-    "NOUN": 0.30,
-}
-
-POS_SEM_THRESHOLD = {
-    "VERB": 0.24,
-    "ADJ": 0.24,
-    "ADV": 0.40,
-    "NOUN": 0.42,
-}
-
-POS_MIN_MARGIN = {
-    "VERB": 0.60,
-    "ADJ": 0.58,
-    "ADV": 0.95,
-    "NOUN": 1.15,
-}
-
-FORCE_ONE_REPLACEMENT = True
-FALLBACK_SENTENCE_GAP = 1.20
-FALLBACK_MIN_SCORE = 0.20
-FALLBACK_MIN_SEM = 0.22
 # -------------------------------------------------
-# Optional external NLP resources with safe fallback
+# Optional resources
 # -------------------------------------------------
 
 _NLTK_READY = False
-_nltk = None
 _wordnet = None
 _WN_LEMMATIZER = None
 _STOPWORDS = None
+_nltk = None
+
+_SPACY_READY = False
+_SPACY_NLP = None
+_HAS_PYINFLECT = False
 
 
 def _try_init_nltk():
-    global _NLTK_READY, _nltk, _wordnet, _WN_LEMMATIZER, _STOPWORDS
+    global _NLTK_READY, _wordnet, _WN_LEMMATIZER, _STOPWORDS, _nltk
     if _NLTK_READY:
         return
 
@@ -98,12 +69,24 @@ def _try_init_nltk():
             except LookupError:
                 try:
                     nltk.download(download_name, quiet=True)
+                    nltk.data.find(lookup_name)
                 except Exception:
                     pass
 
         _nltk = nltk
-        _wordnet = wn
-        _WN_LEMMATIZER = WordNetLemmatizer()
+
+        try:
+            wn.synsets("dog")
+            _wordnet = wn
+        except Exception:
+            _wordnet = None
+
+        try:
+            lemmatizer = WordNetLemmatizer()
+            lemmatizer.lemmatize("dogs", "n")
+            _WN_LEMMATIZER = lemmatizer
+        except Exception:
+            _WN_LEMMATIZER = None
 
         try:
             _STOPWORDS = set(stopwords.words("english"))
@@ -119,344 +102,41 @@ def _try_init_nltk():
     _NLTK_READY = True
 
 
-# -------------------------------------------------
-# Tokenisation / text utils
-# -------------------------------------------------
-
-TOKEN_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|[0-9]+|[^\w\s]")
-
-
-def tokenize(text):
-    return TOKEN_RE.findall(str(text))
-
-
-def detokenize(tokens):
-    text = ""
-    for tok in tokens:
-        if not text:
-            text = tok
-        elif re.match(r"[.,!?;:%)\]\}]", tok):
-            text += tok
-        elif re.match(r"['’]", tok) and text and text[-1].isalpha():
-            text += tok
-        elif text[-1] in "([{" or tok in ["n't", "'s", "'re", "'ve", "'ll", "'d", "'m"]:
-            text += tok
-        else:
-            text += " " + tok
-
-    text = re.sub(
-        r"\b([Aa])\s+([aeiouAEIOU])",
-        lambda m: ("An" if m.group(1) == "A" else "an") + " " + m.group(2),
-        text,
-    )
-    text = re.sub(
-        r"\b([Aa])n\s+([^aeiouAEIOU\W])",
-        lambda m: ("A" if m.group(1) == "A" else "a") + " " + m.group(2),
-        text,
-    )
-    return text
-
-
-def is_word(tok):
-    return bool(re.fullmatch(r"[A-Za-z]+(?:'[A-Za-z]+)?", tok))
-
-
-def is_content_pos(pos):
-    return pos in {"NOUN", "VERB", "ADJ", "ADV"}
-
-
-def is_stopword(word):
-    _try_init_nltk()
-    return word.lower() in _STOPWORDS
-
-
-def valid_vocab_token(tok):
-    if tok is None:
-        return False
-    if not isinstance(tok, str):
-        return False
-    if not re.fullmatch(r"[a-z]+", tok):
-        return False
-    if len(tok) < 3 or len(tok) > 18:
-        return False
-    return True
-
-
-def is_clean_candidate(cand):
-    if not isinstance(cand, str):
-        return False
-    if not re.fullmatch(r"[a-z]+", cand):
-        return False
-    if len(cand) < 3 or len(cand) > 15:
-        return False
-    return True
-
-
-# -------------------------------------------------
-# POS tagging / lemmatisation
-# -------------------------------------------------
-
-def nltk_to_coarse(tag):
-    if tag.startswith("NN"):
-        return "NOUN"
-    if tag.startswith("VB"):
-        return "VERB"
-    if tag.startswith("JJ"):
-        return "ADJ"
-    if tag.startswith("RB"):
-        return "ADV"
-    return "OTHER"
-
-
-def heuristic_pos(tok, prev_tok=""):
-    w = tok.lower()
-    prev = prev_tok.lower() if prev_tok else ""
-
-    if not is_word(tok):
-        return "OTHER"
-    if w.endswith("ly"):
-        return "ADV"
-    if prev == "to":
-        return "VERB"
-    if prev in {"a", "an", "the", "this", "that", "these", "those"}:
-        if w.endswith(("ing", "ed")):
-            return "ADJ"
-        return "NOUN"
-    if w.endswith(("ing", "ed")):
-        return "VERB"
-    if w.endswith(("ous", "ful", "able", "ible", "ive", "al", "ic", "ish", "less", "ant", "ent")):
-        return "ADJ"
-    return "NOUN"
-
-
-def pos_tag_tokens(tokens):
-    _try_init_nltk()
-
-    words = [t for t in tokens if is_word(t)]
-    if _nltk is not None and words:
-        try:
-            tagged_words = _nltk.pos_tag(words)
-            word_iter = iter(tagged_words)
-            coarse_tags = []
-            raw_tags = []
-            for tok in tokens:
-                if is_word(tok):
-                    _, raw = next(word_iter)
-                    coarse_tags.append(nltk_to_coarse(raw))
-                    raw_tags.append(raw)
-                else:
-                    coarse_tags.append("OTHER")
-                    raw_tags.append("OTHER")
-            return coarse_tags, raw_tags
-        except Exception:
-            pass
-
-    coarse_tags = []
-    raw_tags = []
-    for i, tok in enumerate(tokens):
-        prev = tokens[i - 1] if i > 0 else ""
-        coarse = heuristic_pos(tok, prev)
-        coarse_tags.append(coarse)
-        if coarse == "NOUN":
-            raw_tags.append("NN")
-        elif coarse == "VERB":
-            raw_tags.append("VB")
-        elif coarse == "ADJ":
-            raw_tags.append("JJ")
-        elif coarse == "ADV":
-            raw_tags.append("RB")
-        else:
-            raw_tags.append("OTHER")
-    return coarse_tags, raw_tags
-
-
-def _wn_pos_for_coarse(pos):
-    if _wordnet is None:
-        return None
-    return {
-        "NOUN": _wordnet.NOUN,
-        "VERB": _wordnet.VERB,
-        "ADJ": _wordnet.ADJ,
-        "ADV": _wordnet.ADV,
-    }.get(pos)
-
-
-def simple_lemma(word, pos):
-    w = word.lower()
-
-    if pos == "NOUN":
-        if w.endswith("ies") and len(w) > 4:
-            return w[:-3] + "y"
-        if w.endswith("ses") and len(w) > 4:
-            return w[:-2]
-        if w.endswith("s") and len(w) > 3 and not w.endswith("ss"):
-            return w[:-1]
-
-    if pos == "VERB":
-        if w.endswith("ing") and len(w) > 5:
-            base = w[:-3]
-            if len(base) >= 2 and base[-1] == base[-2]:
-                base = base[:-1]
-            return base
-        if w.endswith("ied") and len(w) > 4:
-            return w[:-3] + "y"
-        if w.endswith("ed") and len(w) > 4:
-            base = w[:-2]
-            if len(base) >= 2 and base[-1] == base[-2]:
-                base = base[:-1]
-            return base
-        if w.endswith("es") and len(w) > 4:
-            return w[:-2]
-        if w.endswith("s") and len(w) > 3:
-            return w[:-1]
-
-    if pos == "ADJ":
-        if w.endswith("er") and len(w) > 4:
-            return w[:-2]
-        if w.endswith("est") and len(w) > 5:
-            return w[:-3]
-
-    return w
-
-
-def lemmatize(word, pos):
-    _try_init_nltk()
-    if _WN_LEMMATIZER is not None:
-        try:
-            wn_pos = _wn_pos_for_coarse(pos)
-            if wn_pos is not None:
-                return _WN_LEMMATIZER.lemmatize(word.lower(), pos=wn_pos)
-            return _WN_LEMMATIZER.lemmatize(word.lower())
-        except Exception:
-            pass
-    return simple_lemma(word, pos)
-
-
-def preserve_case(src, tgt):
-    if src.isupper():
-        return tgt.upper()
-    if src[:1].isupper():
-        return tgt[:1].upper() + tgt[1:]
-    return tgt
-
-
-def _guess_ptb_tag(source_tok, source_pos, prev_tok="", next_tok=""):
-    src = source_tok.lower()
-    prev = prev_tok.lower() if prev_tok else ""
-
-    if source_pos == "NOUN":
-        if src.endswith("s") and not src.endswith("ss") and len(src) > 3:
-            return "NNS"
-        return "NN"
-
-    if source_pos == "ADJ":
-        if src.endswith("est"):
-            return "JJS"
-        if src.endswith("er"):
-            return "JJR"
-        return "JJ"
-
-    if source_pos == "ADV":
-        return "RB"
-
-    if source_pos == "VERB":
-        if src.endswith("ing"):
-            return "VBG"
-        if src.endswith("ed"):
-            if prev in {"have", "has", "had"}:
-                return "VBN"
-            return "VBD"
-        if src.endswith("s"):
-            return "VBZ"
-        return "VB"
-
-    return "NN"
-
-
-def _regular_plural(noun):
-    if noun.endswith("y") and len(noun) > 1 and noun[-2] not in "aeiou":
-        return noun[:-1] + "ies"
-    if noun.endswith(("s", "x", "z", "ch", "sh")):
-        return noun + "es"
-    return noun + "s"
-
-
-def _regular_past(verb):
-    if verb.endswith("e"):
-        return verb + "d"
-    if verb.endswith("y") and len(verb) > 1 and verb[-2] not in "aeiou":
-        return verb[:-1] + "ied"
-    if len(verb) >= 3 and verb[-1] not in "aeiouywx" and verb[-2] in "aeiou" and verb[-3] not in "aeiou":
-        return verb + verb[-1] + "ed"
-    return verb + "ed"
-
-
-def _regular_ing(verb):
-    if verb.endswith("ie"):
-        return verb[:-2] + "ying"
-    if verb.endswith("e") and verb not in {"be", "see"}:
-        return verb[:-1] + "ing"
-    if len(verb) >= 3 and verb[-1] not in "aeiouywx" and verb[-2] in "aeiou" and verb[-3] not in "aeiou":
-        return verb + verb[-1] + "ing"
-    return verb + "ing"
-
-
-def _regular_3sg(verb):
-    if verb.endswith("y") and len(verb) > 1 and verb[-2] not in "aeiou":
-        return verb[:-1] + "ies"
-    if verb.endswith(("s", "x", "z", "ch", "sh", "o")):
-        return verb + "es"
-    return verb + "s"
-
-
-def inflect_like(candidate_lemma, source_tok, source_pos, prev_tok="", next_tok=""):
-    cand = candidate_lemma.lower()
-    src = source_tok.lower()
+def _try_init_spacy():
+    global _SPACY_READY, _SPACY_NLP, _HAS_PYINFLECT
+    if _SPACY_READY:
+        return
 
     try:
         import spacy
-        import pyinflect  # noqa: F401
 
-        if not hasattr(inflect_like, "_nlp"):
+        try:
+            _SPACY_NLP = spacy.load("en_core_web_sm")
+        except Exception:
             try:
-                inflect_like._nlp = spacy.load("en_core_web_sm")
+                spacy.cli.download("en_core_web_sm")
+                _SPACY_NLP = spacy.load("en_core_web_sm")
             except Exception:
-                inflect_like._nlp = spacy.blank("en")
+                _SPACY_NLP = None
 
-        ptb_tag = _guess_ptb_tag(source_tok, source_pos, prev_tok, next_tok)
-        doc = inflect_like._nlp(cand)
-        if len(doc) > 0:
-            infl = doc[0]._.inflect(ptb_tag)
-            if infl:
-                return preserve_case(source_tok, infl)
+        try:
+            import pyinflect  # noqa: F401
+            _HAS_PYINFLECT = True
+        except Exception:
+            _HAS_PYINFLECT = False
+
     except Exception:
-        pass
+        _SPACY_NLP = None
+        _HAS_PYINFLECT = False
 
-    if source_pos in {"ADJ", "ADV"}:
-        return preserve_case(source_tok, cand)
-
-    if source_pos == "NOUN":
-        if src.endswith("s") and len(src) > 3 and not src.endswith("ss"):
-            cand = _regular_plural(cand)
-        return preserve_case(source_tok, cand)
-
-    if source_pos == "VERB":
-        if src.endswith("ing"):
-            cand = _regular_ing(cand)
-        elif src.endswith("ed"):
-            cand = _regular_past(cand)
-        elif src.endswith("s"):
-            cand = _regular_3sg(cand)
-        return preserve_case(source_tok, cand)
-
-    return preserve_case(source_tok, cand)
+    _SPACY_READY = True
 
 
 # -------------------------------------------------
-# Training data
+# Training data loading
 # -------------------------------------------------
 
-def load_training_data(path="data.csv"):
+def load_training_data(path: str = "data.csv") -> pd.DataFrame:
     file_path = Path(path)
     if not file_path.exists():
         raise FileNotFoundError("data.csv not found.")
@@ -468,415 +148,591 @@ def load_training_data(path="data.csv"):
     return df
 
 
-def clean_text(s):
-    s = str(s)
-    s = re.sub(r"\b(?:title|subject|date|memo)\s*:\s*", " ", s, flags=re.I)
-    s = re.sub(r"https?://\S+|www\.\S+", " ", s)
-    s = re.sub(r"\b\S+@\S+\b", " ", s)
-    s = re.sub(r"\b[A-Z]{2,}\b", " ", s)
-    s = re.sub(r"[_/\\|@#*+=~<>]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+# -------------------------------------------------
+# Text processing
+# -------------------------------------------------
+
+TOKEN_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|[0-9]+|[^\w\s]")
 
 
-class LexicalModel:
-    def __init__(self, df):
-        self.df = df
+def clean_training_text(text: str) -> str:
+    text = str(text)
+    text = re.sub(r"\b(?:title|subject|date|memo)\s*:\s*", " ", text, flags=re.I)
+    text = re.sub(r"https?://\S+|www\.\S+", " ", text)
+    text = re.sub(r"\b\S+@\S+\b", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def tokenize(text: str) -> List[str]:
+    return TOKEN_RE.findall(str(text))
+
+
+def is_word(tok: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z]+(?:'[A-Za-z]+)?", tok))
+
+
+def is_stopword(word: str) -> bool:
+    _try_init_nltk()
+    return word.lower() in (_STOPWORDS or set())
+
+
+def simple_lemma(word: str) -> str:
+    w = word.lower()
+    if len(w) <= 3:
+        return w
+    if w.endswith("ies"):
+        return w[:-3] + "y"
+    if w.endswith("ing") and len(w) > 5:
+        base = w[:-3]
+        if len(base) >= 2 and base[-1] == base[-2]:
+            base = base[:-1]
+        return base
+    if w.endswith("ied"):
+        return w[:-3] + "y"
+    if w.endswith("ed"):
+        base = w[:-2]
+        if len(base) >= 2 and base[-1] == base[-2]:
+            base = base[:-1]
+        return base
+    if w.endswith("es"):
+        return w[:-2]
+    if w.endswith("s") and not w.endswith("ss"):
+        return w[:-1]
+    return w
+
+
+def lemmatize_word(word: str, pos: str = "n") -> str:
+    _try_init_nltk()
+    if _WN_LEMMATIZER is not None:
+        try:
+            return _WN_LEMMATIZER.lemmatize(word.lower(), pos=pos)
+        except Exception:
+            pass
+    return simple_lemma(word)
+
+
+def sentence_to_lemmas(text: str) -> List[str]:
+    out = []
+    for tok in tokenize(clean_training_text(text)):
+        if is_word(tok):
+            out.append(lemmatize_word(tok))
+    return out
+
+
+# -------------------------------------------------
+# Sentence analysis
+# -------------------------------------------------
+
+def analyze_sentence(sentence: str) -> List[Dict[str, object]]:
+    _try_init_spacy()
+
+    if _SPACY_NLP is not None:
+        doc = _SPACY_NLP(sentence)
+        out = []
+        for token in doc:
+            if token.is_space:
+                continue
+            lemma = token.lemma_.lower() if is_word(token.text) else token.text
+            out.append(
+                {
+                    "token": token.text,
+                    "lemma": lemma,
+                    "pos": token.pos_,
+                    "tag": token.tag_,
+                    "is_stop": token.is_stop,
+                    "is_punct": token.is_punct,
+                    "is_digit": token.like_num,
+                    "is_propn": token.pos_ == "PROPN",
+                    "ws": token.whitespace_,
+                }
+            )
+        return out
+
+    parts = []
+    pattern = re.compile(r"\S+\s*")
+    for m in pattern.finditer(sentence):
+        chunk = m.group(0)
+        token = chunk.rstrip()
+        ws = chunk[len(token):]
+        punct = bool(re.fullmatch(r"[^\w\s]+", token))
+        parts.append(
+            {
+                "token": token,
+                "lemma": lemmatize_word(token.lower()) if not punct and is_word(token) else token,
+                "pos": "X",
+                "tag": "",
+                "is_stop": token.lower() in (_STOPWORDS or set()),
+                "is_punct": punct,
+                "is_digit": token.isdigit(),
+                "is_propn": token.istitle(),
+                "ws": ws,
+            }
+        )
+    return parts
+
+
+# -------------------------------------------------
+# CEFR lexicon + target-level language model
+# -------------------------------------------------
+
+class BigramLM:
+    def __init__(self, k: float = 0.5):
+        self.k = k
+        self.bigram = defaultdict(Counter)
+        self.unigram = Counter()
+        self.vocab = set()
+
+    def update(self, tokens: List[str]):
+        prev = "<s>"
+        self.unigram[prev] += 1
+        self.vocab.add(prev)
+        for tok in tokens + ["</s>"]:
+            self.bigram[prev][tok] += 1
+            self.unigram[tok] += 1
+            self.vocab.add(tok)
+            prev = tok
+
+    def score(self, tokens: List[str]) -> float:
+        if not tokens:
+            return 0.0
+        prev = "<s>"
+        logp = 0.0
+        V = max(1, len(self.vocab))
+        for tok in tokens + ["</s>"]:
+            num = self.bigram[prev][tok] + self.k
+            den = sum(self.bigram[prev].values()) + self.k * V
+            logp += math.log(num / den)
+            prev = tok
+        return logp / max(1, len(tokens))
+
+
+class ResourceBundle:
+    def __init__(self, df: pd.DataFrame):
         self.word_level_counts = defaultdict(lambda: Counter())
-        self.word_freq = Counter()
-        self.bigram_counts = {lvl: defaultdict(Counter) for lvl in CEFR_LEVELS}
-        self.unigram_counts = {lvl: Counter() for lvl in CEFR_LEVELS}
-        self.context_vectors = defaultdict(Counter)
-        self.pos_counts = defaultdict(Counter)
-        self.candidate_pool = []
-        self._difficulty_cache = {}
-
+        self.word_total_freq = Counter()
+        self.level_freq = {lvl: Counter() for lvl in CEFR_LEVELS}
+        self.main_pos = defaultdict(Counter)
+        self.lms = {lvl: BigramLM(k=0.5) for lvl in CEFR_LEVELS}
+        self.cefr_score = {}
+        self.df = df
         self._build()
 
     def _build(self):
         for _, row in self.df.iterrows():
-            text = clean_text(row["text"])
-            level = str(row["cefr_level"]).strip()
+            text = clean_training_text(row.get("text", ""))
+            level = str(row.get("cefr_level", "")).strip()
             if level not in CEFR_LEVELS:
                 continue
 
-            toks = tokenize(text)
-            if not toks:
-                continue
-
-            coarse_tags, raw_tags = pos_tag_tokens(toks)
-
+            analysis = analyze_sentence(text)
             lemmas = []
-            clean_positions = []
-            seen_lemmas = set()
+            seen = set()
 
-            for i, tok in enumerate(toks):
+            for item in analysis:
+                tok = str(item["token"])
+                lemma = str(item["lemma"]).lower()
+                pos = str(item["pos"]).upper()
+
                 if not is_word(tok):
-                    lemmas.append(None)
                     continue
-
-                raw_tag = raw_tags[i]
-                coarse_pos = coarse_tags[i]
-
-                # Remove proper nouns from training vocabulary.
-                if raw_tag in {"NNP", "NNPS"}:
-                    lemmas.append(None)
+                if len(lemma) < 2 or not re.fullmatch(r"[a-z]+", lemma):
                     continue
-
-                lemma = lemmatize(tok, coarse_pos)
-
-                if not valid_vocab_token(lemma):
-                    lemmas.append(None)
+                if item.get("is_propn", False):
                     continue
 
                 lemmas.append(lemma)
+                self.word_total_freq[lemma] += 1
+                self.level_freq[level][lemma] += 1
+                self.main_pos[lemma][pos] += 1
 
-                self.word_freq[lemma] += 1
-                self.pos_counts[lemma][coarse_pos] += 1
-                self.unigram_counts[level][lemma] += 1
-
-                if lemma not in seen_lemmas:
+                if lemma not in seen:
                     self.word_level_counts[lemma][level] += 1
-                    seen_lemmas.add(lemma)
+                    seen.add(lemma)
 
-                if is_content_pos(coarse_pos) and not is_stopword(lemma):
-                    clean_positions.append(i)
+            if lemmas:
+                self.lms[level].update(lemmas)
 
-            prev = "<s>"
-            for lemma in lemmas:
-                if lemma is None:
-                    continue
-                self.bigram_counts[level][prev][lemma] += 1
-                prev = lemma
-            self.bigram_counts[level][prev]["</s>"] += 1
+        for lemma, counts in self.word_level_counts.items():
+            if sum(counts.values()) < MIN_DOC_FREQ:
+                continue
+            alpha = 0.25
+            total = 0.0
+            denom = 0.0
+            for i, lvl in enumerate(CEFR_LEVELS, start=1):
+                c = counts.get(lvl, 0)
+                total += i * (c + alpha)
+                denom += c + alpha
+            self.cefr_score[lemma] = total / max(denom, 1e-9)
 
-            for i in clean_positions:
-                src = lemmas[i]
-                if src is None:
-                    continue
-                left = max(0, i - CONTEXT_WINDOW)
-                right = min(len(lemmas), i + CONTEXT_WINDOW + 1)
-                for j in range(left, right):
-                    if i == j:
-                        continue
-                    nb = lemmas[j]
-                    if nb is None or is_stopword(nb):
-                        continue
-                    self.context_vectors[src][nb] += 1.0 / (abs(i - j))
+    def lemma_score(self, lemma: str) -> Optional[float]:
+        return self.cefr_score.get(lemma.lower())
 
-        self.candidate_pool = [
-            lemma for lemma, freq in self.word_freq.items()
-            if freq >= MIN_WORD_FREQ
-            and valid_vocab_token(lemma)
-            and not is_stopword(lemma)
-        ]
-
-    def main_pos(self, lemma):
-        cnt = self.pos_counts.get(lemma)
+    def dominant_pos(self, lemma: str) -> str:
+        cnt = self.main_pos.get(lemma)
         if not cnt:
-            return "NOUN"
+            return "X"
         return cnt.most_common(1)[0][0]
 
-    def difficulty(self, lemma):
-        if lemma in self._difficulty_cache:
-            return self._difficulty_cache[lemma]
+    def lm_score(self, level: str, tokens: List[str]) -> float:
+        return self.lms[level].score(tokens)
 
-        counts = self.word_level_counts.get(lemma)
-        if not counts:
-            self._difficulty_cache[lemma] = 2.5
-            return 2.5
+    def target_freq_bonus(self, lemma: str, target_level: str) -> float:
+        return math.log1p(self.level_freq[target_level].get(lemma, 0))
 
-        alpha = 0.25
-        total = 0.0
-        denom = 0.0
-        for i, lvl in enumerate(CEFR_LEVELS):
-            c = counts.get(lvl, 0)
-            total += i * (c + alpha)
-            denom += c + alpha
+    def global_freq(self, lemma: str) -> int:
+        return self.word_total_freq.get(lemma, 0)
 
-        score = total / max(denom, 1e-9)
-        self._difficulty_cache[lemma] = score
-        return score
 
-    def confidence(self, lemma):
-        return math.log1p(self.word_freq.get(lemma, 0))
+_RESOURCES = None
 
-    def level_freq(self, lemma, level):
-        return self.unigram_counts[level].get(lemma, 0)
 
-    def target_band_ok(self, lemma, target_idx):
-        diff = self.difficulty(lemma)
-        return abs(diff - target_idx) <= TARGET_BAND
+def get_resources(path: str = "data.csv") -> ResourceBundle:
+    global _RESOURCES
+    if _RESOURCES is None:
+        df = load_training_data(path)
+        _RESOURCES = ResourceBundle(df)
+    return _RESOURCES
 
-    def local_lm_logprob(self, prev_lemma, lemma, level):
-        prev_counter = self.bigram_counts[level].get(prev_lemma, Counter())
-        vocab_size = max(len(self.candidate_pool), 1)
-        numerator = prev_counter.get(lemma, 0) + 0.25
-        denominator = sum(prev_counter.values()) + 0.25 * vocab_size
-        return math.log(numerator / max(denominator, 1e-12))
 
-    def context_cosine(self, a, b):
-        if a == b:
-            return 1.0
+# -------------------------------------------------
+# Candidate identification
+# -------------------------------------------------
 
-        va = self.context_vectors.get(a)
-        vb = self.context_vectors.get(b)
-        if not va or not vb:
-            return 0.0
+ALLOWED_REPLACE_POS = {"VERB", "ADJ"}
 
-        keys = set(va.keys()) & set(vb.keys())
-        if not keys:
-            return 0.0
 
-        dot = sum(va[k] * vb[k] for k in keys)
-        na = math.sqrt(sum(v * v for v in va.values()))
-        nb = math.sqrt(sum(v * v for v in vb.values()))
-        if na == 0 or nb == 0:
-            return 0.0
-        return dot / (na * nb)
+def is_replaceable(item: Dict[str, object]) -> bool:
+    if item.get("is_punct") or item.get("is_digit") or item.get("is_stop"):
+        return False
+    if item.get("is_propn"):
+        return False
+    pos = str(item.get("pos", "")).upper()
+    if pos not in ALLOWED_REPLACE_POS:
+        return False
+    token = str(item.get("token", ""))
+    if not is_word(token):
+        return False
+    if len(token) <= 2:
+        return False
+    return True
 
-    def distributional_candidates(self, lemma, pos, target_idx):
-        if lemma not in self.context_vectors:
-            return []
 
-        scored = []
-        src_diff = self.difficulty(lemma)
+def identify_positions(sentence: str, source_level: str, target_level: str) -> List[Dict[str, object]]:
+    bundle = get_resources()
+    src_num = LEVEL_TO_NUM[source_level]
+    tgt_num = LEVEL_TO_NUM[target_level]
+    direction = "down" if tgt_num < src_num else "up"
 
-        for cand in self.candidate_pool:
-            if cand == lemma:
-                continue
-            if self.main_pos(cand) != pos:
-                continue
-            if not self.target_band_ok(cand, target_idx):
-                continue
-            if not is_clean_candidate(cand):
-                continue
+    analysis = analyze_sentence(sentence)
+    candidates = []
 
-            #ctx = self.context_cosine(lemma, cand)
-            #if ctx < DIST_CTX_THRESHOLD:
-                #continue
+    for idx, item in enumerate(analysis):
+        if not is_replaceable(item):
+            continue
 
-            ctx = self.context_cosine(lemma, cand)
-            ctx_threshold = POS_DIST_CTX_THRESHOLD.get(pos, DIST_CTX_THRESHOLD)
-            if ctx < ctx_threshold:
-                continue
+        lemma = str(item["lemma"]).lower()
+        score = bundle.lemma_score(lemma)
+        if score is None:
+            continue
 
-            tgt_gain = abs(src_diff - target_idx) - abs(self.difficulty(cand) - target_idx)
-            if tgt_gain < 0.05:
-                continue
+        if direction == "down" and score <= tgt_num:
+            continue
+        if direction == "up" and score >= tgt_num:
+            continue
 
-            scored.append((ctx + 0.25 * tgt_gain, cand))
+        candidates.append(
+            {
+                "idx": idx,
+                "lemma": lemma,
+                "token": item["token"],
+                "pos": str(item["pos"]).upper(),
+                "tag": str(item["tag"]),
+                "score": score,
+                "distance": abs(score - tgt_num),
+            }
+        )
 
-        scored.sort(reverse=True)
-        return [c for _, c in scored[:MAX_DIST_CANDIDATES]]
+    candidates.sort(key=lambda x: x["distance"], reverse=True)
+    return candidates[:MAX_POSITIONS_TO_CHECK]
 
-    def wordnet_candidates(self, lemma, pos):
-        _try_init_nltk()
-        if _wordnet is None:
-            return []
 
-        wn_pos = _wn_pos_for_coarse(pos)
-        if wn_pos is None:
-            return []
+# -------------------------------------------------
+# Semantic similarity + candidate generation
+# -------------------------------------------------
 
-        out = []
-        seen = set()
+def semantic_similarity(w1: str, w2: str) -> float:
+    w1 = w1.lower().strip()
+    w2 = w2.lower().strip()
+    if not w1 or not w2:
+        return 0.0
+    if w1 == w2:
+        return 1.0
 
+    _try_init_spacy()
+    if _SPACY_NLP is not None:
         try:
-            synsets = _wordnet.synsets(lemma, pos=wn_pos)
+            lex1 = _SPACY_NLP.vocab[w1]
+            lex2 = _SPACY_NLP.vocab[w2]
+            if lex1.has_vector and lex2.has_vector:
+                dot = float((lex1.vector * lex2.vector).sum())
+                mag = float((lex1.vector**2).sum() ** 0.5) * float((lex2.vector**2).sum() ** 0.5)
+                if mag > 0:
+                    return max(0.0, min(1.0, dot / mag))
         except Exception:
-            synsets = []
+            pass
 
-        for syn in synsets[:5]:
+    _try_init_nltk()
+    if _wordnet is not None:
+        try:
+            syns1 = _wordnet.synsets(w1)
+            syns2 = _wordnet.synsets(w2)
+            best = 0.0
+            for s1 in syns1[:3]:
+                for s2 in syns2[:3]:
+                    sim = s1.path_similarity(s2)
+                    if sim is not None and sim > best:
+                        best = sim
+            return best
+        except Exception:
+            pass
+
+    return 0.0
+
+
+def generate_candidates(
+    lemma: str,
+    pos: str,
+    source_score: float,
+    target_num: int,
+    target_level: str,
+) -> List[str]:
+    bundle = get_resources()
+    direction = "down" if target_num < source_score else "up"
+
+    out = []
+    seen = set()
+
+    _try_init_nltk()
+    if _wordnet is None:
+        return []
+
+    wn_pos_map = {
+        "VERB": _wordnet.VERB,
+        "ADJ": _wordnet.ADJ,
+        "ADV": _wordnet.ADV,
+        "NOUN": _wordnet.NOUN,
+    }
+    wn_pos = wn_pos_map.get(pos)
+
+    try:
+        synsets = _wordnet.synsets(lemma, pos=wn_pos) if wn_pos else _wordnet.synsets(lemma)
+    except Exception:
+        synsets = []
+
+    if pos == "VERB":
+        selected_synsets = synsets[:2]
+        for syn in selected_synsets:
+            for l in syn.lemmas():
+                cand = l.name().replace("_", " ").lower().strip()
+                if " " in cand or cand == lemma or cand in seen:
+                    continue
+                if not re.fullmatch(r"[a-z]+", cand):
+                    continue
+                if bundle.global_freq(cand) < MIN_GLOBAL_CAND_FREQ:
+                    continue
+                cand_score = bundle.lemma_score(cand)
+                if cand_score is None:
+                    continue
+                if direction == "down" and cand_score >= source_score:
+                    continue
+                if direction == "up" and cand_score <= source_score:
+                    continue
+                if abs(cand_score - target_num) >= abs(source_score - target_num):
+                    continue
+                if bundle.dominant_pos(cand) not in {"VERB", "X"}:
+                    continue
+                seen.add(cand)
+                out.append(cand)
+
+    elif pos == "ADJ":
+        selected_synsets = synsets[:4]
+        for syn in selected_synsets:
             related = [syn]
             try:
-                related.extend(syn.similar_tos()[:2])
+                related.extend(syn.similar_tos()[:1])
             except Exception:
                 pass
             for rs in related:
                 for l in rs.lemmas():
-                    cand = l.name().replace("_", " ").lower()
-                    if " " in cand:
+                    cand = l.name().replace("_", " ").lower().strip()
+                    if " " in cand or cand == lemma or cand in seen:
                         continue
-                    if cand == lemma or cand in seen:
+                    if not re.fullmatch(r"[a-z]+", cand):
                         continue
-                    if not is_clean_candidate(cand):
+                    if bundle.global_freq(cand) < MIN_GLOBAL_CAND_FREQ:
+                        continue
+                    cand_score = bundle.lemma_score(cand)
+                    if cand_score is None:
+                        continue
+                    if direction == "down" and cand_score >= source_score:
+                        continue
+                    if direction == "up" and cand_score <= source_score:
+                        continue
+                    if abs(cand_score - target_num) >= abs(source_score - target_num):
+                        continue
+                    if bundle.dominant_pos(cand) != "ADJ":
                         continue
                     seen.add(cand)
                     out.append(cand)
 
-        return out[:MAX_WN_CANDIDATES]
+    out.sort(key=lambda w: bundle.target_freq_bonus(w, target_level), reverse=True)
+    return out[:MAX_WORDNET_CANDIDATES]
 
 
 # -------------------------------------------------
-# Global model init
+# Inflection / reconstruction
 # -------------------------------------------------
 
-_MODEL = None
+_IRREGULAR_FORMS = {
+    "be": {"VBD": "was", "VBN": "been", "VBG": "being", "VBZ": "is", "VBP": "are"},
+    "buy": {"VBD": "bought", "VBN": "bought", "VBG": "buying", "VBZ": "buys"},
+    "build": {"VBD": "built", "VBN": "built", "VBG": "building", "VBZ": "builds"},
+    "do": {"VBD": "did", "VBN": "done", "VBG": "doing", "VBZ": "does"},
+    "go": {"VBD": "went", "VBN": "gone", "VBG": "going", "VBZ": "goes"},
+    "have": {"VBD": "had", "VBN": "had", "VBG": "having", "VBZ": "has"},
+    "see": {"VBD": "saw", "VBN": "seen", "VBG": "seeing", "VBZ": "sees"},
+    "take": {"VBD": "took", "VBN": "taken", "VBG": "taking", "VBZ": "takes"},
+    "try": {"VBD": "tried", "VBN": "tried", "VBG": "trying", "VBZ": "tries"},
+}
 
 
-def get_model():
-    global _MODEL
-    if _MODEL is None:
-        df = load_training_data("data.csv")
-        _MODEL = LexicalModel(df)
-    return _MODEL
+def match_case(word: str, template: str) -> str:
+    if template.isupper():
+        return word.upper()
+    if template.istitle():
+        return word.title()
+    return word.lower()
+
+
+def heuristic_inflect_verb(lemma: str, tag: str) -> str:
+    tag = (tag or "").upper()
+    base = lemma.lower()
+    if base in _IRREGULAR_FORMS and tag in _IRREGULAR_FORMS[base]:
+        return _IRREGULAR_FORMS[base][tag]
+    if tag in {"VBD", "VBN"}:
+        if base.endswith("e"):
+            return base + "d"
+        if base.endswith("y") and len(base) > 1 and base[-2] not in "aeiou":
+            return base[:-1] + "ied"
+        return base + "ed"
+    if tag == "VBG":
+        if base.endswith("e") and not base.endswith("ee"):
+            return base[:-1] + "ing"
+        return base + "ing"
+    if tag == "VBZ":
+        if base.endswith("y") and len(base) > 1 and base[-2] not in "aeiou":
+            return base[:-1] + "ies"
+        if base.endswith(("s", "sh", "ch", "x", "z", "o")):
+            return base + "es"
+        return base + "s"
+    return base
+
+
+def restore_surface(candidate_lemma: str, original_token: str, pos: str, tag: str) -> str:
+    _try_init_spacy()
+    if _HAS_PYINFLECT and _SPACY_NLP is not None and tag:
+        try:
+            doc = _SPACY_NLP(candidate_lemma)
+            infl = doc[0]._.inflect(tag)
+            if infl:
+                return match_case(infl, original_token)
+        except Exception:
+            pass
+
+    out = candidate_lemma.lower()
+    if pos == "VERB":
+        out = heuristic_inflect_verb(out, tag)
+    elif pos == "ADJ":
+        out = candidate_lemma.lower()
+
+    return match_case(out, original_token)
+
+
+def reconstruct_sentence(items: List[Dict[str, object]]) -> str:
+    parts = []
+    for item in items:
+        parts.append(str(item["token"]) + str(item.get("ws", "")))
+    return "".join(parts).rstrip()
+
+
+def apply_replacement(sentence: str, idx: int, candidate_lemma: str) -> str:
+    items = analyze_sentence(sentence)
+    if idx < 0 or idx >= len(items):
+        return sentence
+
+    item = items[idx]
+    item["token"] = restore_surface(
+        candidate_lemma,
+        str(item["token"]),
+        str(item["pos"]).upper(),
+        str(item["tag"]),
+    )
+    return reconstruct_sentence(items)
 
 
 # -------------------------------------------------
 # Candidate scoring
 # -------------------------------------------------
 
-def semantic_similarity(src_lemma, cand_lemma, pos, model):
-    base = model.context_cosine(src_lemma, cand_lemma)
-
-    _try_init_nltk()
-    wn_bonus = 0.0
-    if _wordnet is not None:
-        wn_pos = _wn_pos_for_coarse(pos)
-        if wn_pos is not None:
-            try:
-                src_syns = _wordnet.synsets(src_lemma, pos=wn_pos)[:4]
-                cand_syns = _wordnet.synsets(cand_lemma, pos=wn_pos)[:4]
-                best = 0.0
-                for s1 in src_syns:
-                    for s2 in cand_syns:
-                        val = s1.wup_similarity(s2) or 0.0
-                        if val > best:
-                            best = val
-                wn_bonus = best
-            except Exception:
-                wn_bonus = 0.0
-
-    return max(base, 0.60 * base + 0.40 * wn_bonus)
-
-"""
-def token_is_replaceable(tok, pos, idx, tokens):
-    if not is_word(tok):
-        return False
-    if not is_content_pos(pos):
-        return False
-    if is_stopword(tok):
-        return False
-    if len(tok) <= 2:
-        return False
-    if tok[0].isupper() and idx != 0:
-        return False
-
-    # More conservative on subject nouns near sentence start.
-    if pos == "NOUN" and idx <= 1:
-        return False
-    if pos == "NOUN" and idx > 0 and tokens[idx - 1].lower() in {"the", "a", "an"} and idx <= 2:
-        return False
-
-    return True
-"""
-# Prioritize adj adv verb
-"""
-def token_is_replaceable(tok, pos, idx, tokens):
-    if not is_word(tok):
-        return False
-    if not is_content_pos(pos):
-        return False
-    if is_stopword(tok):
-        return False
-    if len(tok) <= 2:
-        return False
-    if tok[0].isupper() and idx != 0:
-        return False
-
-    # Be conservative for nouns.
-    if pos == "NOUN":
-        if idx <= 1:
-            return False
-        if idx > 0 and tokens[idx - 1].lower() in {"the", "a", "an"}:
-            return False
-
-    return True
-"""
-def token_is_replaceable(tok, pos, idx, tokens):
-    if not is_word(tok):
-        return False
-    if pos not in {"VERB", "ADJ"}:
-        return False
-    if is_stopword(tok):
-        return False
-    if len(tok) <= 2:
-        return False
-    if tok[0].isupper() and idx != 0:
-        return False
-    return True
-
 def score_candidate(
-    source_lemma,
-    cand_lemma,
-    source_pos,
-    prev_lemma,
-    target_level,
-    target_idx,
-    model,
-    direction,
-):
-    src_diff = model.difficulty(source_lemma)
-    cand_diff = model.difficulty(cand_lemma)
+    sentence: str,
+    idx: int,
+    source_lemma: str,
+    candidate_lemma: str,
+    source_score: float,
+    target_num: int,
+    target_level: str,
+) -> float:
+    bundle = get_resources()
 
-    target_gain = abs(src_diff - target_idx) - abs(cand_diff - target_idx)
-    sem = semantic_similarity(source_lemma, cand_lemma, source_pos, model)
-    ctx = model.context_cosine(source_lemma, cand_lemma)
+    candidate_score = bundle.lemma_score(candidate_lemma)
+    if candidate_score is None:
+        return -1.0
 
-    lm_keep = model.local_lm_logprob(prev_lemma, source_lemma, target_level)
-    lm_cand = model.local_lm_logprob(prev_lemma, cand_lemma, target_level)
-    lm_gain = lm_cand - lm_keep
+    target_gain = abs(source_score - target_num) - abs(candidate_score - target_num)
+    if target_gain <= MIN_TARGET_GAIN:
+        return -1.0
 
-    freq_bonus = (
-        math.log1p(model.level_freq(cand_lemma, target_level))
-        - math.log1p(model.level_freq(source_lemma, target_level))
+    sem = semantic_similarity(source_lemma, candidate_lemma)
+    if sem < MIN_SEMANTIC_SIM:
+        return -1.0
+
+    replaced = apply_replacement(sentence, idx, candidate_lemma)
+    lm_score = bundle.lm_score(target_level, sentence_to_lemmas(replaced))
+    freq_bonus = bundle.target_freq_bonus(candidate_lemma, target_level)
+
+    context = 1.0 / (1.0 + math.exp(-(lm_score + 4.0)))
+
+    length_penalty = 0.0
+    if len(candidate_lemma) > len(source_lemma) + 2:
+        length_penalty = -0.08
+
+    final = (
+        ALPHA_TARGET * target_gain
+        + ALPHA_SEM * sem
+        + ALPHA_CONTEXT * context
+        + ALPHA_FREQ * min(1.0, freq_bonus / 5.0)
+        + length_penalty
     )
-
-    if direction < 0:
-        length_bonus = (len(source_lemma) - len(cand_lemma)) / 8.0
-    else:
-        length_bonus = (len(cand_lemma) - len(source_lemma)) / 8.0
-
-    """
-    total = (
-        W_TARGET * target_gain
-        + W_SEMANTIC * sem
-        + W_CONTEXT * ctx
-        + W_LM * lm_gain
-        + W_FREQ * freq_bonus
-        + W_LENGTH * length_bonus
-    )
-    """
-    #noun_penalty = -0.45 if source_pos == "NOUN" else 0.0
-
-    total = (
-            W_TARGET * target_gain
-            + W_SEMANTIC * sem
-            + W_CONTEXT * ctx
-            + W_LM * lm_gain
-            + W_FREQ * freq_bonus
-            + W_LENGTH * length_bonus
-            #+ noun_penalty
-    )
-
-    return {
-        "target_gain": target_gain,
-        "semantic": sem,
-        "context": ctx,
-        "lm_gain": lm_gain,
-        "freq_bonus": freq_bonus,
-        "length_bonus": length_bonus,
-        "final_total": total,
-        "cand_diff": cand_diff,
-    }
+    return final
 
 
 # -------------------------------------------------
 # Required function
 # -------------------------------------------------
 
-def transform_sentence(sentence, source_level, target_level):
+def transform_sentence_impl(sentence, source_level, target_level):
     if source_level not in CEFR_LEVELS:
         raise ValueError(f"Invalid source CEFR level: {source_level}")
     if target_level not in CEFR_LEVELS:
@@ -885,203 +741,60 @@ def transform_sentence(sentence, source_level, target_level):
     if not sentence or source_level == target_level:
         return sentence
 
-    model = get_model()
-    target_idx = LEVEL_TO_IDX[target_level]
-    source_idx = LEVEL_TO_IDX[source_level]
-    direction = -1 if target_idx < source_idx else 1
-
-    tokens = tokenize(sentence)
-    if not tokens:
+    target_num = LEVEL_TO_NUM[target_level]
+    positions = identify_positions(sentence, source_level, target_level)
+    if not positions:
         return sentence
 
-    pos_tags, raw_tags = pos_tag_tokens(tokens)
-    lemmas = [lemmatize(tok, pos_tags[i]) if is_word(tok) else None for i, tok in enumerate(tokens)]
-
-    sentence_max_gap = 0.0
-    position_scores = []
-    for i, tok in enumerate(tokens):
-        pos = pos_tags[i]
-        if not token_is_replaceable(tok, pos, i, tokens):
-            continue
-
-        lemma = lemmas[i]
-        if lemma is None or not valid_vocab_token(lemma):
-            continue
-
-        diff = model.difficulty(lemma)
-        gap = abs(diff - target_idx)
-        conf = model.confidence(lemma)
-
-        sentence_max_gap = max(sentence_max_gap, gap)
-
-        if gap < DIFF_THRESHOLD:
-            continue
-
-        if direction < 0 and diff <= target_idx + 0.15:
-            continue
-        if direction > 0 and diff >= target_idx - 0.15:
-            continue
-
-        priority = gap + 0.10 * conf
-        position_scores.append((priority, i))
-
-        if DEBUG_TRACE:
-            print(
-                f"[TRACE] inspect token='{tok}' lemma='{lemma}' pos={pos} "
-                f"difficulty={diff:.2f} target={target_idx} gap={gap:.2f} conf={conf:.2f}"
-            )
-
-    position_scores.sort(reverse=True)
-    chosen_positions = [i for _, i in position_scores[:TOP_POSITIONS]]
-
-    new_tokens = list(tokens)
+    updated_sentence = sentence
     replacements_done = 0
 
-    fallback_best = None
-    fallback_best_feats = None
-    fallback_best_pos = None
-    fallback_best_tok = None
-    fallback_best_pos_tag = None
-
-    for i in chosen_positions:
+    for pos_info in positions:
         if replacements_done >= MAX_REPLACEMENTS:
             break
 
-        tok = new_tokens[i]
-        pos = pos_tags[i]
-        lemma = lemmas[i]
-        prev_lemma = lemmas[i - 1] if i > 0 and lemmas[i - 1] is not None else "<s>"
+        idx = int(pos_info["idx"])
+        source_lemma = str(pos_info["lemma"])
+        source_pos = str(pos_info["pos"]).upper()
+        source_score = float(pos_info["score"])
 
-        candidates = set()
+        candidates = generate_candidates(
+            lemma=source_lemma,
+            pos=source_pos,
+            source_score=source_score,
+            target_num=target_num,
+            target_level=target_level,
+        )
+        if not candidates:
+            continue
 
-        #for cand in model.wordnet_candidates(lemma, pos):
-            #candidates.add(cand)
-       #for cand in model.distributional_candidates(lemma, pos, target_idx):
-            #candidates.add(cand)
-        #if pos in {"VERB", "ADJ", "ADV"}:
-        if pos in {"VERB", "ADJ"}:
-            for cand in model.wordnet_candidates(lemma, pos):
-                candidates.add(cand)
-
-            for cand in model.distributional_candidates(lemma, pos, target_idx):
-                candidates.add(cand)
-
-        filtered = []
-        src_diff = model.difficulty(lemma)
+        best_cand = None
+        best_score = -1.0
 
         for cand in candidates:
-            if cand == lemma:
-                continue
-            if not is_clean_candidate(cand):
-                continue
-            if model.word_freq.get(cand, 0) < MIN_WORD_FREQ:
-                continue
-            if model.main_pos(cand) != pos:
-                continue
-            if not model.target_band_ok(cand, target_idx):
-                continue
-
-            cand_diff = model.difficulty(cand)
-            if abs(cand_diff - target_idx) >= abs(src_diff - target_idx) - 0.01:
-                continue
-
-            #sem = semantic_similarity(lemma, cand, pos, model)
-            #if sem < FINAL_SEM_THRESHOLD:
-                #continue
-            sem = semantic_similarity(lemma, cand, pos, model)
-            sem_threshold = POS_SEM_THRESHOLD.get(pos, FINAL_SEM_THRESHOLD)
-            if sem < sem_threshold:
-                continue
-            filtered.append(cand)
-
-        if DEBUG_TRACE:
-            print(f"[TRACE] position={i} token='{tok}' lemma='{lemma}' pos={pos}")
-            print(f"[TRACE] raw candidates={sorted(candidates)[:20]}")
-            print(f"[TRACE] filtered={filtered[:15]}")
-
-        best = None
-        best_feats = None
-
-        for cand in filtered:
-            feats = score_candidate(
-                lemma,
-                cand,
-                pos,
-                prev_lemma,
-                target_level,
-                target_idx,
-                model,
-                direction,
+            s = score_candidate(
+                sentence=updated_sentence,
+                idx=idx,
+                source_lemma=source_lemma,
+                candidate_lemma=cand,
+                source_score=source_score,
+                target_num=target_num,
+                target_level=target_level,
             )
+            if s > best_score:
+                best_score = s
+                best_cand = cand
 
-            if DEBUG_TRACE:
-                print(
-                    f"[TRACE] cand='{cand}' diff={feats['cand_diff']:.2f} "
-                    f"target_gain={feats['target_gain']:.2f} sem={feats['semantic']:.2f} "
-                    f"ctx={feats['context']:.2f} lm={feats['lm_gain']:.2f} "
-                    f"freq={feats['freq_bonus']:.2f} len={feats['length_bonus']:.2f} "
-                    f"final={feats['final_total']:.2f}"
-                )
-
-            if best_feats is None or feats["final_total"] > best_feats["final_total"]:
-                best = cand
-                best_feats = feats
-
-        if best is None:
+        if best_cand is None or best_score < MIN_FINAL_SCORE:
             continue
 
-        if best is not None and best_feats is not None:
-            if fallback_best_feats is None or best_feats["final_total"] > fallback_best_feats["final_total"]:
-                fallback_best = best
-                fallback_best_feats = best_feats
-                fallback_best_pos = i
-                fallback_best_tok = tok
-                fallback_best_pos_tag = pos
+        new_sentence = apply_replacement(updated_sentence, idx, best_cand)
+        if new_sentence != updated_sentence:
+            updated_sentence = new_sentence
+            replacements_done += 1
 
-        # if best_feats["final_total"] < MIN_REPLACE_MARGIN:
-        # continue
-        min_margin = POS_MIN_MARGIN.get(pos, MIN_REPLACE_MARGIN)
-        if best_feats["final_total"] < min_margin:
-            continue
+    return updated_sentence
 
-        replacement = inflect_like(
-            best,
-            tok,
-            pos,
-            prev_tok=new_tokens[i - 1] if i > 0 else "",
-            next_tok=new_tokens[i + 1] if i + 1 < len(new_tokens) else "",
-        )
 
-        if replacement.lower() == tok.lower():
-            continue
-        if not re.fullmatch(r"[A-Za-z]+(?:'[A-Za-z]+)?", replacement):
-            continue
-
-        if DEBUG_TRACE:
-            print(f"[TRACE] replace '{tok}' -> '{replacement}' score={best_feats['final_total']:.2f}")
-
-        new_tokens[i] = replacement
-        lemmas[i] = lemmatize(replacement, pos)
-        replacements_done += 1
-
-    if (
-            replacements_done == 0
-            and FORCE_ONE_REPLACEMENT
-            and fallback_best is not None
-            and fallback_best_feats is not None
-            and sentence_max_gap >= FALLBACK_SENTENCE_GAP
-            and fallback_best_feats["final_total"] >= FALLBACK_MIN_SCORE
-            and fallback_best_feats["semantic"] >= FALLBACK_MIN_SEM
-    ):
-        replacement = inflect_like(
-            fallback_best,
-            fallback_best_tok,
-            fallback_best_pos_tag,
-            prev_tok=new_tokens[fallback_best_pos - 1] if fallback_best_pos > 0 else "",
-            next_tok=new_tokens[fallback_best_pos + 1] if fallback_best_pos + 1 < len(new_tokens) else "",
-        )
-
-        if replacement.lower() != fallback_best_tok.lower() and re.fullmatch(r"[A-Za-z]+(?:'[A-Za-z]+)?", replacement):
-            new_tokens[fallback_best_pos] = replacement
-
-    return detokenize(new_tokens)
+def transform_sentence(sentence, source_level, target_level):
+    return transform_sentence_impl(sentence, source_level, target_level)

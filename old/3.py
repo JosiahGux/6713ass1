@@ -118,7 +118,7 @@ def _get_wordnet():
         except LookupError:
             try:
                 nltk.download("wordnet", quiet=True)
-                nltk.download("omw-1.4", quiet=True)
+                nltk.download("omw-TestResults.4", quiet=True)
                 wn.synsets("dog")
             except Exception:
                 return None

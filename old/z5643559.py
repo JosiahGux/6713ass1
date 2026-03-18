@@ -306,7 +306,7 @@ def transform_sentence(sentence, source_level, target_level):
 
             filtered.append(s)
 
-        # Relaxed pass: if nothing found, allow candidates within +/-1 level of target
+        # Relaxed pass: if nothing found, allow candidates within +/-TestResults level of target
         if not filtered:
             for s in synonyms:
                 level = lookup_level(s)

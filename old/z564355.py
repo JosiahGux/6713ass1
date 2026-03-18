@@ -86,13 +86,13 @@ _SENT_END = "</s>"
 
 class BigramLM:
     """
-    Bigram language model trained on data.csv with Laplace (add-1) smoothing.
-    P(w_i | w_{i-1}) = (count(w_{i-1}, w_i) + 1) / (count(w_{i-1}) + V)
+    Bigram language model trained on data.csv with Laplace (add-TestResults) smoothing.
+    P(w_i | w_{i-TestResults}) = (count(w_{i-TestResults}, w_i) + TestResults) / (count(w_{i-TestResults}) + V)
     """
 
     def __init__(self, k=1.0):
         """
-        k: smoothing parameter (Laplace = 1, add-k smoothing).
+        k: smoothing parameter (Laplace = TestResults, add-k smoothing).
         """
         self.k = k
         self.bigram_counts = defaultdict(lambda: defaultdict(float))
@@ -307,7 +307,7 @@ def _best_replacement(
             import random
             candidates = random.Random(42).sample(candidates, max_candidates)
 
-        # Frequency in target level (normalised 0..1)
+        # Frequency in target level (normalised 0..TestResults)
         def freq_score(w):
             if not level_counts or not target_level:
                 return 0.5
@@ -451,7 +451,7 @@ def transform_sentence(sentence, source_level, target_level):
 
 
 # Eager-load vocab and LM when module is imported, so training output
-# appears before main.py prints "Test 1", "Test 2", ...
+# appears before main.py prints "Test TestResults", "Test 2", ...
 if __name__ != "__main__":
     try:
         print("Initialising (training runs first, then tests below).\n")
