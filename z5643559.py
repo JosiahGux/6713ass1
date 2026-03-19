@@ -6,7 +6,6 @@ import re
 
 import pandas as pd
 
-
 CEFR_LEVELS = ["A1", "A2", "B1", "B2", "C1", "C2"]
 
 # use numbers to represent registration
@@ -60,6 +59,21 @@ _SPACY_NLP = None
 
 _HAS_PYINFLECT = False
 
+
+import sys
+import subprocess
+
+def _silent_install_spacy_model():
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "en-core-web-sm==3.8.0"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        return True
+    except Exception:
+        return False
 
 def _try_init_nltk():
     """
@@ -138,12 +152,26 @@ def _try_init_spacy():
         import spacy
 
         # prefer loading spacy
+        """
         try:
             _SPACY_NLP = spacy.load("en_core_web_sm")
         except Exception:
             try:
                 spacy.cli.download("en_core_web_sm")
                 _SPACY_NLP = spacy.load("en_core_web_sm")
+            except Exception:
+                _SPACY_NLP = None
+        """
+
+        try:
+            _SPACY_NLP = spacy.load("en_core_web_sm")
+        except Exception:
+            try:
+                ok = _silent_install_spacy_model()
+                if ok:
+                    _SPACY_NLP = spacy.load("en_core_web_sm")
+                else:
+                    _SPACY_NLP = None
             except Exception:
                 _SPACY_NLP = None
 
