@@ -747,7 +747,7 @@ _MODEL = None
 def get_model():
     global _MODEL
     if _MODEL is None:
-        df = load_training_data("data.csv")
+        df = load_training_data("../data.csv")
         _MODEL = LexicalModel(df)
     return _MODEL
 
